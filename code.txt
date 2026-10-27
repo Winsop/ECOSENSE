@@ -1,0 +1,290 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <LiquidCrystal_I2C.h>
+
+// ================= WIRING PINOUTS =================
+#define RELAY_FAN    18 // Active LOW
+#define RELAY_LAMP   19 // Active LOW
+#define PIN_TEMP     32 // LM35
+#define TRIG_PIN     27 // HC-SR04
+#define ECHO_PIN     4  // HC-SR04 (via Level Converter)
+#define BTN_MODE     13 
+#define BTN_RESET    14
+#define BUZZER       33 
+
+// ================= CONFIGURATION =================
+const char* ssid = "one23";     // CHANGE THIS
+const char* password = "123456789"; // CHANGE THIS
+
+const float COST_PER_KWH = 8.50;            // Electricity tariff rate (₹ per kWh)
+
+WebServer server(80);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Global Unified State Variable
+bool powerState = false; // Controls BOTH fan and lamp
+unsigned long lastUpdate = 0;
+int lcdScreen = 0;
+
+// Simulated PZEM Base Variables (Lowered starting baselines for smaller loads)
+float currentVoltage = 230.0;
+float fanEnergy = 0.142;
+float lampEnergy = 0.085;
+
+// ================= HELPER FUNCTIONS =================
+float randomFloat(float min, float max) {
+  return min + ((float)random(0, 1000) / 1000.0) * (max - min);
+}
+
+float getTemperature() {
+  int rawValue = analogRead(PIN_TEMP);
+  float voltage = rawValue * (3.3 / 4095.0);
+  return (voltage * 100.0) + 10.0; // Added +10 degree calibration offset
+}
+
+float getDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout
+  if (duration == 0) return 0.0;
+  return (duration * 0.0343) / 2.0;
+}
+
+// ================= WEB SERVER HTML =================
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Smart Energy Dashboard</title>
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #121212; color: #ffffff; text-align: center; margin: 0; padding: 20px; }
+    h2 { color: #00adb5; margin-bottom: 5px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; max-width: 1000px; margin: 0 auto; }
+    .card { background: #1e1e24; padding: 20px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.3); border-top: 4px solid #00adb5; }
+    .val { font-size: 2em; font-weight: bold; margin: 10px 0; color: #ffeb3b; }
+    .btn { color: white; border: none; padding: 15px 30px; font-size: 1.2em; border-radius: 5px; cursor: pointer; margin: 20px auto; transition: 0.3s; width: 100%; max-width: 1000px; font-weight: bold; display: block; }
+    .cost-val { color: #4caf50; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h2>⚡ Smart Energy Monitor</h2>
+  
+  <!-- Single Master Button -->
+  <button id="btn_master" class="btn" style="background:#00adb5;" onclick="toggleRelay()">Turn ALL ON</button>
+
+  <div class="grid">
+    <div class="card">
+      <h3>System Status</h3>
+      <div>Grid Voltage: <span id="volts" class="val">--</span> V</div>
+      <div>Frequency: <span id="freq">--</span> Hz</div>
+      <div>Total Cost: <span id="t_cost" class="val cost-val">--</span> ₹</div>
+      <div style="margin-top:10px;">Temperature: <span id="temp" style="color:#ff5722; font-weight:bold;">--</span> &deg;C</div>
+      <div>Motion/Distance: <span id="dist">--</span> cm</div>
+    </div>
+    <div class="card">
+      <h3>Fan Load (Channel 1)</h3>
+      <div>Current: <span id="f_cur" class="val">--</span> A</div>
+      <div>Power: <span id="f_pow">--</span> W</div>
+      <div>Energy: <span id="f_kwh">--</span> kWh</div>
+      <div>Cost: <span id="f_cost" class="cost-val">--</span> ₹</div>
+    </div>
+    <div class="card">
+      <h3>Lamp Load (Channel 2)</h3>
+      <div>Current: <span id="l_cur" class="val">--</span> A</div>
+      <div>Power: <span id="l_pow">--</span> W</div>
+      <div>Energy: <span id="l_kwh">--</span> kWh</div>
+      <div>Cost: <span id="l_cost" class="cost-val">--</span> ₹</div>
+    </div>
+  </div>
+
+  <script>
+    function updateData() {
+      fetch('/data').then(res => res.json()).then(data => {
+        document.getElementById("volts").innerText = data.volts;
+        document.getElementById("freq").innerText = data.freq;
+        document.getElementById("temp").innerText = data.temp;
+        document.getElementById("dist").innerText = data.dist;
+        
+        document.getElementById("f_cur").innerText = data.f_cur;
+        document.getElementById("f_pow").innerText = data.f_pow;
+        document.getElementById("f_kwh").innerText = data.f_kwh;
+        document.getElementById("f_cost").innerText = data.f_cost;
+        
+        document.getElementById("l_cur").innerText = data.l_cur;
+        document.getElementById("l_pow").innerText = data.l_pow;
+        document.getElementById("l_kwh").innerText = data.l_kwh;
+        document.getElementById("l_cost").innerText = data.l_cost;
+
+        document.getElementById("t_cost").innerText = data.t_cost;
+
+        // Update Single Master Button Style
+        let btnMaster = document.getElementById("btn_master");
+        btnMaster.innerText = data.p_state ? "Turn ALL OFF" : "Turn ALL ON";
+        btnMaster.style.background = data.p_state ? "#ff2e63" : "#00adb5";
+      });
+    }
+    
+    function toggleRelay() {
+      fetch('/toggle');
+      setTimeout(updateData, 500); // Quick refresh to show new state
+    }
+    
+    setInterval(updateData, 1500); // Auto refresh every 1.5 seconds
+    window.onload = updateData;
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// ================= SERVER ROUTES =================
+void handleRoot() {
+  server.send(200, "text/html", INDEX_HTML);
+}
+
+void handleToggle() {
+  powerState = !powerState;
+  digitalWrite(RELAY_FAN, powerState ? LOW : HIGH); // Active LOW: LOW = ON
+  digitalWrite(RELAY_LAMP, powerState ? LOW : HIGH); // Active LOW: LOW = ON
+  
+  server.send(200, "text/plain", "OK");
+}
+
+void handleData() {
+  // Generate Realistic Simulated Data
+  currentVoltage = randomFloat(225.0, 235.0);
+  float freq = randomFloat(49.8, 50.2);
+  
+  // Simulated Fan math for a 15-25W 120mm AC Axial Fan
+  float f_cur = powerState ? randomFloat(0.07, 0.12) : 0.00;
+  float f_pow = powerState ? (currentVoltage * f_cur * 0.82) : 0.00; // Inductive PF 0.82
+  if(powerState) fanEnergy += randomFloat(0.000005, 0.000015);
+  
+  // Simulated Lamp math for a 7-12W LED Bulb
+  float l_cur = powerState ? randomFloat(0.03, 0.06) : 0.00;
+  float l_pow = powerState ? (currentVoltage * l_cur * 0.90) : 0.00; // Typical LED PF 0.90
+  if(powerState) lampEnergy += randomFloat(0.000002, 0.000008);
+
+  float temp = getTemperature();
+  float dist = getDistance();
+
+  // Cost Calculations
+  float f_cost = fanEnergy * COST_PER_KWH;
+  float l_cost = lampEnergy * COST_PER_KWH;
+  float t_cost = f_cost + l_cost;
+
+  // Build JSON Response
+  String json = "{";
+  json += "\"p_state\":" + String(powerState ? "true" : "false") + ",";
+  json += "\"volts\":\"" + String(currentVoltage, 1) + "\",";
+  json += "\"freq\":\"" + String(freq, 1) + "\",";
+  json += "\"temp\":\"" + String(temp, 1) + "\",";
+  json += "\"dist\":\"" + String(dist, 1) + "\",";
+  json += "\"f_cur\":\"" + String(f_cur, 3) + "\",";
+  json += "\"f_pow\":\"" + String(f_pow, 1) + "\",";
+  json += "\"f_kwh\":\"" + String(fanEnergy, 4) + "\",";
+  json += "\"f_cost\":\"" + String(f_cost, 2) + "\",";
+  json += "\"l_cur\":\"" + String(l_cur, 3) + "\",";
+  json += "\"l_pow\":\"" + String(l_pow, 1) + "\",";
+  json += "\"l_kwh\":\"" + String(lampEnergy, 4) + "\",";
+  json += "\"l_cost\":\"" + String(l_cost, 2) + "\",";
+  json += "\"t_cost\":\"" + String(t_cost, 2) + "\"";
+  json += "}";
+  
+  server.send(200, "application/json", json);
+}
+
+// ================= MAIN SETUP =================
+void setup() {
+  Serial.begin(115200);
+  
+  // Init Pins
+  pinMode(RELAY_FAN, OUTPUT);
+  pinMode(RELAY_LAMP, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(BUZZER, OUTPUT);
+  
+  pinMode(BTN_MODE, INPUT_PULLUP);
+  pinMode(BTN_RESET, INPUT_PULLUP);
+
+  // Start Relays OFF (Active LOW = HIGH state is off)
+  digitalWrite(RELAY_FAN, HIGH);
+  digitalWrite(RELAY_LAMP, HIGH);
+  digitalWrite(BUZZER, LOW);
+
+  // Init LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi.");
+
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  int dots = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    lcd.setCursor(15, 0);
+    if(dots % 2 == 0) lcd.print("*"); else lcd.print(" ");
+    dots++;
+  }
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("WiFi Connected!");
+  lcd.setCursor(0, 1);
+  lcd.print(WiFi.localIP().toString());
+  delay(3000);
+  lcd.clear();
+
+  // Setup Server Routes
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/toggle", handleToggle);
+  server.begin();
+}
+
+// ================= MAIN LOOP =================
+void loop() {
+  server.handleClient();
+  
+  float currentTemp = getTemperature();
+
+  // Handle Physical Button (Toggles BOTH relays simultaneously)
+  if (digitalRead(BTN_MODE) == LOW) {
+    powerState = !powerState;
+    digitalWrite(RELAY_FAN, powerState ? LOW : HIGH);
+    digitalWrite(RELAY_LAMP, powerState ? LOW : HIGH);
+    delay(300); // Debounce
+  }
+
+  // LCD Screen Cycling Logic (Every 2.5 seconds)
+  if (millis() - lastUpdate > 2500) {
+    lastUpdate = millis();
+    lcd.clear();
+    
+    if (lcdScreen == 0) {
+      lcd.setCursor(0, 0);
+      lcd.print("V: "); lcd.print(currentVoltage, 1); lcd.print("V");
+      lcd.setCursor(0, 1);
+      lcd.print("Temp: "); lcd.print(currentTemp, 1); lcd.print("C");
+    } 
+    else if (lcdScreen == 1) {
+      lcd.setCursor(0, 0);
+      lcd.print("Fan: "); 
+      if(powerState) { lcd.print((currentVoltage * 0.09 * 0.82), 1); lcd.print("W"); }
+      else { lcd.print("OFF"); }
+      lcd.setCursor(0, 1);
+      lcd.print("Lmp: "); 
+      if(powerState) { lcd.print((currentVoltage * 0.04 * 0.90), 1); lcd.print("W"); }
+      else { lcd.print("OFF"); }
+    }
+    
+    lcdScreen++;
+    if (lcdScreen > 1) lcdScreen = 0;
+  }
+}
